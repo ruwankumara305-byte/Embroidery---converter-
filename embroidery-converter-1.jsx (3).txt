@@ -1,0 +1,399 @@
+import { useState, useRef, useEffect } from "react";
+
+function encodeDST(stitches, colors, width, height) {
+  const result = new Array(512).fill(0x20);
+  const hdr = (s, off) => { for (let i = 0; i < s.length; i++) result[off + i] = s.charCodeAt(i); };
+  hdr(`LA:EmbroideryDesign\r`, 0);
+  hdr(`ST:${stitches.length}\r`, 20);
+  hdr(`CO:${Math.min(colors, 99)}\r`, 40);
+  hdr(`+X:${Math.round(width * 10)}\r`, 50);
+  hdr(`+Y:${Math.round(height * 10)}\r`, 60);
+  hdr(`-X:0\r`, 70); hdr(`-Y:0\r`, 80);
+  hdr(`AX:+0\r`, 90); hdr(`AY:+0\r`, 100);
+  hdr(`MX:+0\r`, 110); hdr(`MY:+0\r`, 120);
+  hdr(`PD:******\r`, 130);
+  result[510] = 0x1A; result[511] = 0x00;
+  let px = 0, py = 0;
+  for (const s of stitches) {
+    let dx = Math.max(-121, Math.min(121, Math.round(s.x - px)));
+    let dy = Math.max(-121, Math.min(121, Math.round(s.y - py)));
+    px = s.x; py = s.y;
+    let b0 = 0, b1 = 0, b2 = s.jump ? 0x83 : s.colorChange ? 0xC3 : s.end ? 0xF3 : 0x03;
+    const ea = (v, ph, pl, nh, nl) => {
+      if (v > 0) { b2 |= ph; if (v > 40) { b2 |= pl; v -= 81; } }
+      else if (v < 0) { v = -v; b2 |= nh; if (v > 40) { b2 |= nl; v -= 81; } }
+      return v;
+    };
+    dx = ea(dx, 0x08, 0x04, 0x02, 0x01);
+    dy = ea(dy, 0x40, 0x20, 0x80, 0x10);
+    b0 |= ((dx & 0x0F) << 4) | (dy & 0x0F);
+    b1 |= ((dx >> 4) & 0x03) | (((dy >> 4) & 0x03) << 2);
+    result.push(b0, b1, b2);
+  }
+  result.push(0x00, 0x00, 0xF3);
+  return new Uint8Array(result);
+}
+
+function encodePES(stitches, colors) {
+  const b = [];
+  const s8 = (s) => { for (const c of s) b.push(c.charCodeAt(0)); };
+  const u8 = (v) => b.push(v & 0xFF);
+  const u16 = (v) => { b.push(v & 0xFF, (v >> 8) & 0xFF); };
+  const u32 = (v) => { b.push(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF); };
+  s8("#PES0001");
+  const pOff = b.length; u32(0);
+  s8("CEmbOne            "); for (let i = 0; i < 17; i++) u8(0);
+  u16(1); u16(0); u16(0); u16(0xFFFF); u16(0);
+  const pec = b.length;
+  const dv = new DataView(new ArrayBuffer(4)); dv.setUint32(0, pec, true);
+  for (let i = 0; i < 4; i++) b[pOff + i] = dv.getUint8(i);
+  s8("%PEC0001"); s8("EmbDesign   "); for (let i = 0; i < 16; i++) u8(0);
+  u8(0x20); u8(0x20); u8(0x20); u8(0x20); u8(colors); for (let i = 0; i < 14; i++) u8(0);
+  let px = 0, py = 0;
+  for (const s of stitches) {
+    const dx = Math.round(s.x - px), dy = Math.round(s.y - py);
+    px = s.x; py = s.y;
+    if (s.end) { u8(0xFF); break; }
+    if (s.colorChange) { u8(0xFE); u8(0xB0); u8(0x01); continue; }
+    if (s.jump || Math.abs(dx) > 63 || Math.abs(dy) > 63) {
+      u8(0x80); u8(0x04); u8((dx >> 1) & 0xFF); u8((dy >> 1) & 0xFF);
+    } else {
+      u8(dx >= 0 ? dx : dx + 128); u8(dy >= 0 ? dy : dy + 128);
+    }
+  }
+  u8(0xFF);
+  return new Uint8Array(b);
+}
+
+function encodeJEF(stitches, colors, width, height) {
+  const b = [];
+  const u8 = (v) => b.push(v & 0xFF);
+  const i16 = (v) => { v = Math.round(v); b.push(v & 0xFF, (v >> 8) & 0xFF); };
+  const u32 = (v) => { b.push(v & 0xFF, (v >> 8) & 0xFF, (v >> 16) & 0xFF, (v >> 24) & 0xFF); };
+  const dataOff = 0x74 + colors * 8;
+  u32(dataOff); u32(0); u32(0); u32(stitches.length); u32(colors);
+  i16(width * 10); i16(height * 10); i16(0); i16(0); i16(width * 10); i16(height * 10);
+  while (b.length < 0x74) u8(0);
+  for (let c = 0; c < colors; c++) { u32(c); u32(0); }
+  let px = 0, py = 0;
+  for (const s of stitches) {
+    if (s.end) { u8(0x80); u8(0x08); break; }
+    if (s.colorChange) { u8(0x88); u8(0x00); continue; }
+    const dx = Math.round(s.x - px), dy = Math.round(s.y - py);
+    px = s.x; py = s.y;
+    i16(dx); i16(dy);
+  }
+  u8(0x80); u8(0x08);
+  return new Uint8Array(b);
+}
+
+function imageToStitches(pixels, w, h, density, maxColors, scale) {
+  const step = Math.max(1, Math.round(4 / density));
+  const groups = {}, palette = {};
+  for (let y = 0; y < h; y += step) {
+    for (let x = 0; x < w; x += step) {
+      const i = (y * w + x) * 4;
+      if (pixels[i + 3] < 128) continue;
+      const r = Math.round(pixels[i] / 40) * 40;
+      const g = Math.round(pixels[i + 1] / 40) * 40;
+      const bl = Math.round(pixels[i + 2] / 40) * 40;
+      const key = `${r},${g},${bl}`;
+      if (!groups[key]) { groups[key] = []; palette[key] = { r, g, b: bl }; }
+      groups[key].push({ x: Math.round((x / w) * w * scale * 0.5), y: Math.round((y / h) * h * scale * 0.5) });
+    }
+  }
+  const sorted = Object.entries(groups).sort((a, b) => b[1].length - a[1].length).slice(0, maxColors);
+  const stitches = [], usedPalette = [];
+  let first = true;
+  for (const [key, pts] of sorted) {
+    usedPalette.push(palette[key]);
+    if (!first) stitches.push({ x: stitches[stitches.length - 1]?.x || 0, y: stitches[stitches.length - 1]?.y || 0, colorChange: true });
+    first = false;
+    const byRow = {};
+    for (const p of pts) {
+      const row = Math.round(p.y / (step * scale * 0.5));
+      if (!byRow[row]) byRow[row] = [];
+      byRow[row].push(p);
+    }
+    const rows = Object.keys(byRow).sort((a, b) => +a - +b);
+    for (let ri = 0; ri < rows.length; ri++) {
+      const row = byRow[rows[ri]].sort((a, b) => ri % 2 === 0 ? a.x - b.x : b.x - a.x);
+      let jumpNext = true;
+      for (const p of row) { stitches.push({ x: p.x, y: p.y, jump: jumpNext }); jumpNext = false; }
+    }
+  }
+  stitches.push({ x: stitches[stitches.length - 1]?.x || 0, y: stitches[stitches.length - 1]?.y || 0, end: true });
+  return { stitches, palette: usedPalette, colors: sorted.length, width: w * scale * 0.5, height: h * scale * 0.5 };
+}
+
+function drawPreview(canvas, data) {
+  if (!canvas || !data) return;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.fillStyle = "#f5efe0"; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = "rgba(0,0,0,0.06)"; ctx.lineWidth = 0.5;
+  for (let i = 0; i < W; i += 16) { ctx.beginPath(); ctx.moveTo(i, 0); ctx.lineTo(i, H); ctx.stroke(); }
+  for (let i = 0; i < H; i += 16) { ctx.beginPath(); ctx.moveTo(0, i); ctx.lineTo(W, i); ctx.stroke(); }
+  const xs = data.stitches.map(s => s.x), ys = data.stitches.map(s => s.y);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys), maxY = Math.max(...ys);
+  const rangeX = maxX - minX || 1, rangeY = maxY - minY || 1;
+  const sc = Math.min((W * 0.88) / rangeX, (H * 0.88) / rangeY);
+  const ox = (W - rangeX * sc) / 2 - minX * sc;
+  const oy = (H - rangeY * sc) / 2 - minY * sc;
+  let ci = 0, prev = null;
+  for (const s of data.stitches) {
+    if (s.colorChange) { ci = Math.min(ci + 1, data.palette.length - 1); prev = null; continue; }
+    if (s.end) break;
+    const x = ox + s.x * sc, y = oy + s.y * sc;
+    if (prev && !s.jump) {
+      const c = data.palette[ci] || data.palette[0];
+      ctx.strokeStyle = `rgba(${c.r},${c.g},${c.b},0.85)`;
+      ctx.lineWidth = 1.4;
+      ctx.beginPath(); ctx.moveTo(prev.x, prev.y); ctx.lineTo(x, y); ctx.stroke();
+    }
+    prev = { x, y };
+  }
+}
+
+export default function App() {
+  const [imgSrc, setImgSrc] = useState(null);
+  const [pixels, setPixels] = useState(null);
+  const [imgDims, setImgDims] = useState({ w: 0, h: 0 });
+  const [stitchData, setStitchData] = useState(null);
+  const [step, setStep] = useState("upload");
+  const [settings, setSettings] = useState({ density: 2, colors: 6, scale: 1.5 });
+  const [format, setFormat] = useState("dst");
+  const [drag, setDrag] = useState(false);
+  const [processing, setProcessing] = useState(false);
+  const [error, setError] = useState(null);
+  const fileRef = useRef(null);
+  const previewRef = useRef(null);
+
+  useEffect(() => {
+    if (stitchData && previewRef.current) drawPreview(previewRef.current, stitchData);
+  }, [stitchData]);
+
+  const readFile = (file) => {
+    setError(null);
+    if (!file) return;
+    if (!file.type.startsWith("image/")) { setError("Please select an image file (PNG, JPG, GIF, WEBP)"); return; }
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const src = e.target.result;
+      const img = new window.Image();
+      img.onload = () => {
+        const MAX = 180;
+        const ratio = Math.min(MAX / img.width, MAX / img.height, 1);
+        const w = Math.max(1, Math.round(img.width * ratio));
+        const h = Math.max(1, Math.round(img.height * ratio));
+        const cv = document.createElement("canvas");
+        cv.width = w; cv.height = h;
+        const ctx = cv.getContext("2d");
+        ctx.drawImage(img, 0, 0, w, h);
+        const id = ctx.getImageData(0, 0, w, h);
+        setPixels(id.data);
+        setImgDims({ w, h });
+        setImgSrc(src);
+        setStep("settings");
+      };
+      img.onerror = () => setError("Could not load image. Please try another file.");
+      img.src = src;
+    };
+    reader.onerror = () => setError("Could not read file.");
+    reader.readAsDataURL(file);
+  };
+
+  const convert = () => {
+    if (!pixels) return;
+    setProcessing(true); setError(null);
+    setTimeout(() => {
+      try {
+        const data = imageToStitches(pixels, imgDims.w, imgDims.h, settings.density, settings.colors, settings.scale);
+        setStitchData(data); setStep("preview");
+      } catch (e) { setError("Conversion error: " + e.message); }
+      setProcessing(false);
+    }, 60);
+  };
+
+  const download = () => {
+    if (!stitchData) return;
+    const { stitches, colors, width, height } = stitchData;
+    let bytes;
+    if (format === "dst") bytes = encodeDST(stitches, colors, width, height);
+    else if (format === "pes") bytes = encodePES(stitches, colors);
+    else bytes = encodeJEF(stitches, colors, width, height);
+    const url = URL.createObjectURL(new Blob([bytes], { type: "application/octet-stream" }));
+    const a = document.createElement("a"); a.href = url; a.download = `embroidery.${format}`; a.click();
+    URL.revokeObjectURL(url);
+    setStep("done");
+  };
+
+  const reset = () => { setImgSrc(null); setPixels(null); setStitchData(null); setStep("upload"); setError(null); };
+
+  const F = { fontFamily: "'Courier New', monospace" };
+
+  return (
+    <div style={{ ...F, minHeight: "100vh", background: "#0c0c0c", color: "#ddd", display: "flex", flexDirection: "column", alignItems: "center", padding: "28px 16px" }}>
+      <div style={{ textAlign: "center", marginBottom: 32 }}>
+        <div style={{ fontSize: "0.6rem", letterSpacing: "5px", color: "#555", marginBottom: 6 }}>MACHINE EMBROIDERY STUDIO</div>
+        <h1 style={{ margin: 0, fontSize: "clamp(1.4rem,4vw,2.1rem)", fontWeight: 900, letterSpacing: 2, color: "#f0c070" }}>IMAGE → STITCH</h1>
+        <div style={{ display: "flex", justifyContent: "center", gap: 6, marginTop: 10 }}>
+          {[".DST", ".PES", ".JEF"].map(f => (
+            <span key={f} style={{ fontSize: "0.65rem", padding: "2px 8px", border: "1px solid #f0c07055", color: "#f0c070", letterSpacing: 2 }}>{f}</span>
+          ))}
+        </div>
+      </div>
+
+      {/* Steps */}
+      <div style={{ display: "flex", alignItems: "center", marginBottom: 32 }}>
+        {[["01","Upload"],["02","Settings"],["03","Preview"],["04","Export"]].map(([n, l], i) => {
+          const on = ["upload","settings","preview","done"].indexOf(step) >= i;
+          return (
+            <div key={n} style={{ display: "flex", alignItems: "center" }}>
+              <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3 }}>
+                <div style={{ width: 26, height: 26, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", background: on ? "#f0c070" : "transparent", border: `1px solid ${on ? "#f0c070" : "#333"}`, color: on ? "#000" : "#444", fontSize: "0.6rem", fontWeight: 900 }}>{n}</div>
+                <span style={{ fontSize: "0.55rem", color: on ? "#f0c070" : "#444", letterSpacing: 1, textTransform: "uppercase" }}>{l}</span>
+              </div>
+              {i < 3 && <div style={{ width: 36, height: 1, background: on ? "#f0c07044" : "#1a1a1a", margin: "0 6px", marginBottom: 18 }} />}
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{ width: "100%", maxWidth: 680, background: "#111", border: "1px solid #1e1e1e", borderRadius: 4, padding: 28 }}>
+        {error && <div style={{ background: "#2a0a0a", border: "1px solid #5a1a1a", borderRadius: 3, padding: "10px 14px", marginBottom: 18, fontSize: "0.75rem", color: "#ff8080" }}>⚠ {error}</div>}
+
+        {/* UPLOAD */}
+        {step === "upload" && (
+          <div>
+            <div
+              onClick={() => { fileRef.current.value = ""; fileRef.current.click(); }}
+              onDragOver={e => { e.preventDefault(); setDrag(true); }}
+              onDragLeave={() => setDrag(false)}
+              onDrop={e => { e.preventDefault(); setDrag(false); readFile(e.dataTransfer.files[0]); }}
+              style={{ border: `2px dashed ${drag ? "#f0c070" : "#2a2a2a"}`, borderRadius: 4, padding: "56px 24px", textAlign: "center", cursor: "pointer", background: drag ? "rgba(240,192,112,0.04)" : "transparent", transition: "all 0.2s" }}
+            >
+              <div style={{ fontSize: "2.5rem", marginBottom: 14, opacity: 0.5 }}>📁</div>
+              <div style={{ color: "#888", marginBottom: 6, fontSize: "0.9rem" }}>Click to select image, or drag & drop</div>
+              <div style={{ fontSize: "0.72rem", color: "#444" }}>PNG · JPG · JPEG · GIF · WEBP</div>
+            </div>
+            <input ref={fileRef} type="file" accept="image/png,image/jpeg,image/gif,image/webp,image/svg+xml"
+              style={{ display: "none" }}
+              onChange={e => { if (e.target.files && e.target.files[0]) readFile(e.target.files[0]); }} />
+            <div style={{ marginTop: 14, padding: 13, background: "#0a0a0a", border: "1px solid #1a1a1a", borderRadius: 3, fontSize: "0.7rem", color: "#555", lineHeight: 1.9 }}>
+              💡 Best results with high-contrast images, logos, or simple line art
+            </div>
+          </div>
+        )}
+
+        {/* SETTINGS */}
+        {step === "settings" && (
+          <div style={{ display: "flex", gap: 28, flexWrap: "wrap" }}>
+            <div>
+              <div style={{ fontSize: "0.6rem", color: "#555", letterSpacing: 2, marginBottom: 10 }}>IMAGE PREVIEW</div>
+              <img src={imgSrc} alt="preview" style={{ width: 160, height: 160, objectFit: "contain", background: "#0a0a0a", border: "1px solid #1e1e1e", borderRadius: 2, display: "block" }} />
+              <div style={{ fontSize: "0.6rem", color: "#444", marginTop: 6 }}>{imgDims.w} × {imgDims.h} px</div>
+              <button onClick={reset} style={{ marginTop: 10, padding: "6px 12px", background: "transparent", color: "#555", border: "1px solid #222", borderRadius: 2, cursor: "pointer", fontSize: "0.65rem", fontFamily: "'Courier New',monospace" }}>← Change Image</button>
+            </div>
+            <div style={{ flex: 1, minWidth: 220 }}>
+              <div style={{ fontSize: "0.6rem", color: "#555", letterSpacing: 2, marginBottom: 18 }}>CONVERSION SETTINGS</div>
+              {[
+                { key: "density", label: "Stitch Density", min: 1, max: 5, step: 0.5, fmt: v => v <= 1.5 ? "Low" : v <= 2.5 ? "Medium" : v <= 3.5 ? "High" : "Very High" },
+                { key: "colors", label: "Max Thread Colors", min: 1, max: 12, step: 1, fmt: v => `${v} colors` },
+                { key: "scale", label: "Output Scale", min: 0.5, max: 4, step: 0.5, fmt: v => `${Math.round(v * 100)}%` },
+              ].map(({ key, label, min, max, step: s, fmt }) => (
+                <div key={key} style={{ marginBottom: 18 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+                    <span style={{ fontSize: "0.72rem", color: "#888" }}>{label}</span>
+                    <span style={{ fontSize: "0.72rem", color: "#f0c070" }}>{fmt(settings[key])}</span>
+                  </div>
+                  <input type="range" min={min} max={max} step={s} value={settings[key]}
+                    onChange={e => setSettings(p => ({ ...p, [key]: parseFloat(e.target.value) }))}
+                    style={{ width: "100%", accentColor: "#f0c070" }} />
+                </div>
+              ))}
+              <div style={{ marginBottom: 20 }}>
+                <div style={{ fontSize: "0.6rem", color: "#555", letterSpacing: 2, marginBottom: 10 }}>OUTPUT FORMAT</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  {[["dst","DST","Universal"],["pes","PES","Brother"],["jef","JEF","Janome"]].map(([id, name, sub]) => (
+                    <div key={id} onClick={() => setFormat(id)} style={{ flex: 1, padding: "10px 6px", textAlign: "center", cursor: "pointer", borderRadius: 2, background: format === id ? "rgba(240,192,112,0.1)" : "transparent", border: `1px solid ${format === id ? "#f0c070" : "#222"}`, transition: "all 0.15s" }}>
+                      <div style={{ fontSize: "0.8rem", fontWeight: 900, color: format === id ? "#f0c070" : "#666" }}>.{name}</div>
+                      <div style={{ fontSize: "0.58rem", color: "#444", marginTop: 2 }}>{sub}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+              <button onClick={convert} disabled={processing} style={{ width: "100%", padding: 14, background: processing ? "#333" : "#f0c070", color: "#000", border: "none", borderRadius: 2, fontSize: "0.8rem", fontWeight: 900, letterSpacing: 3, cursor: processing ? "not-allowed" : "pointer", fontFamily: "'Courier New',monospace" }}>
+                {processing ? "CONVERTING..." : "CONVERT →"}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* PREVIEW */}
+        {step === "preview" && stitchData && (
+          <div>
+            <div style={{ display: "flex", gap: 24, flexWrap: "wrap", marginBottom: 24 }}>
+              <div style={{ flex: 2, minWidth: 240 }}>
+                <div style={{ fontSize: "0.6rem", color: "#555", letterSpacing: 2, marginBottom: 10 }}>STITCH PREVIEW</div>
+                <canvas ref={previewRef} width={360} height={280} style={{ width: "100%", borderRadius: 2, border: "1px solid #1e1e1e", display: "block" }} />
+              </div>
+              <div style={{ flex: 1, minWidth: 150 }}>
+                <div style={{ fontSize: "0.6rem", color: "#555", letterSpacing: 2, marginBottom: 14 }}>DESIGN INFO</div>
+                {[
+                  ["Stitches", stitchData.stitches.filter(s => !s.jump && !s.colorChange && !s.end).length.toLocaleString()],
+                  ["Colors", stitchData.colors],
+                  ["Format", `.${format.toUpperCase()}`],
+                  ["Width", `${Math.round(stitchData.width * 0.1)}mm`],
+                  ["Height", `${Math.round(stitchData.height * 0.1)}mm`],
+                ].map(([k, v]) => (
+                  <div key={k} style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", borderBottom: "1px solid #191919" }}>
+                    <span style={{ fontSize: "0.68rem", color: "#555" }}>{k}</span>
+                    <span style={{ fontSize: "0.72rem", color: k === "Format" ? "#f0c070" : "#999", fontWeight: 700 }}>{v}</span>
+                  </div>
+                ))}
+                <div style={{ marginTop: 16 }}>
+                  <div style={{ fontSize: "0.6rem", color: "#555", marginBottom: 8 }}>THREAD PALETTE</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                    {stitchData.palette.map((c, i) => (
+                      <div key={i} title={`RGB(${c.r},${c.g},${c.b})`} style={{ width: 22, height: 22, borderRadius: "50%", background: `rgb(${c.r},${c.g},${c.b})`, border: "1px solid #333" }} />
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button onClick={() => setStep("settings")} style={{ flex: 1, padding: 12, background: "transparent", color: "#666", border: "1px solid #222", borderRadius: 2, cursor: "pointer", fontSize: "0.75rem", fontFamily: "'Courier New',monospace" }}>← Adjust</button>
+              <button onClick={download} style={{ flex: 2, padding: 12, background: "#f0c070", color: "#000", border: "none", borderRadius: 2, cursor: "pointer", fontSize: "0.8rem", fontWeight: 900, letterSpacing: 2, fontFamily: "'Courier New',monospace" }}>⬇ DOWNLOAD .{format.toUpperCase()}</button>
+            </div>
+          </div>
+        )}
+
+        {/* DONE */}
+        {step === "done" && (
+          <div style={{ textAlign: "center", padding: "36px 0" }}>
+            <div style={{ fontSize: "2.5rem", color: "#f0c070", marginBottom: 12 }}>✓</div>
+            <div style={{ fontSize: "1rem", color: "#f0c070", letterSpacing: 3, marginBottom: 8 }}>FILE DOWNLOADED</div>
+            <div style={{ fontSize: "0.75rem", color: "#555", marginBottom: 28 }}>embroidery.{format} is ready for your machine</div>
+            <div style={{ background: "#0a0a0a", border: "1px solid #1a1a1a", borderRadius: 3, padding: 18, marginBottom: 24, textAlign: "left" }}>
+              <div style={{ fontSize: "0.6rem", color: "#555", letterSpacing: 2, marginBottom: 10 }}>COMPATIBLE MACHINES</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {(format === "dst" ? ["Brother","Babylock","Janome","Singer","Bernina","Most commercial machines"] :
+                  format === "pes" ? ["Brother PE series","Brother Innovis","Babylock"] :
+                  ["Janome 300E","Janome 350E","Janome MC series"]).map(m => (
+                  <span key={m} style={{ fontSize: "0.68rem", padding: "3px 9px", background: "#141414", border: "1px solid #222", color: "#666" }}>{m}</span>
+                ))}
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+              <button onClick={() => setStep("preview")} style={{ padding: "11px 20px", background: "transparent", color: "#666", border: "1px solid #222", borderRadius: 2, cursor: "pointer", fontSize: "0.75rem", fontFamily: "'Courier New',monospace" }}>← Preview</button>
+              <button onClick={reset} style={{ padding: "11px 24px", background: "#f0c070", color: "#000", border: "none", borderRadius: 2, cursor: "pointer", fontSize: "0.8rem", fontWeight: 900, letterSpacing: 2, fontFamily: "'Courier New',monospace" }}>+ NEW DESIGN</button>
+            </div>
+          </div>
+        )}
+      </div>
+      <div style={{ marginTop: 20, fontSize: "0.6rem", color: "#2a2a2a", textAlign: "center" }}>Always test on scrap fabric before production</div>
+    </div>
+  );
+}
