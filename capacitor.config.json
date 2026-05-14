@@ -1,0 +1,6 @@
+{
+  "appId": "com.emb.stitch",
+  "appName": "Embroidery",
+  "webDir": "build",
+  "bundledWebRuntime": false
+}
