@@ -1,0 +1,48 @@
+name: Build Android APK with Bubblewrap
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      
+      - name: Install Dependencies
+        run: npm install
+      
+      - name: Build React App
+        run: CI=false npm run build
+      
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      
+      - name: Install Bubblewrap
+        run: npm install -g @bubblewrap/cli
+      
+      - name: Initialize Bubblewrap
+        run: |
+          mkdir -p android
+          cd android
+          bubblewrap init --manifest=../build/manifest.json
+      
+      - name: Build APK with Bubblewrap
+        run: |
+          cd android
+          bubblewrap build
+      
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: embroidery-app
+          path: android/app/build/outputs/apk/*.apk
